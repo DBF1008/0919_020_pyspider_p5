@@ -27,8 +27,13 @@ from six.moves.urllib.robotparser import RobotFileParser
 from requests import cookies
 from six.moves.urllib.parse import urljoin, urlsplit
 from tornado import gen
-from tornado.curl_httpclient import CurlAsyncHTTPClient
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
+
+try:
+    from tornado.curl_httpclient import CurlAsyncHTTPClient
+except ImportError:
+    # pycurl is not installed, fallback to SimpleAsyncHTTPClient
+    CurlAsyncHTTPClient = None
 
 from pyspider.libs import utils, dataurl, counter
 from pyspider.libs.url import quote_chinese
@@ -36,13 +41,16 @@ from .cookie_utils import extract_cookies_to_jar
 logger = logging.getLogger('fetcher')
 
 
-class MyCurlAsyncHTTPClient(CurlAsyncHTTPClient):
+if CurlAsyncHTTPClient is not None:
+    class MyCurlAsyncHTTPClient(CurlAsyncHTTPClient):
 
-    def free_size(self):
-        return len(self._free_list)
+        def free_size(self):
+            return len(self._free_list)
 
-    def size(self):
-        return len(self._curls) - self.free_size()
+        def size(self):
+            return len(self._curls) - self.free_size()
+else:
+    MyCurlAsyncHTTPClient = None
 
 
 class MySimpleAsyncHTTPClient(SimpleAsyncHTTPClient):
@@ -77,6 +85,7 @@ class Fetcher(object):
     splash_endpoint = None
     splash_lua_source = open(os.path.join(os.path.dirname(__file__), "splash_fetcher.lua")).read()
     robot_txt_age = 60*60  # 1h
+    robots_txt_cache_size = 1024
 
     def __init__(self, inqueue, outqueue, poolsize=100, proxy=None, async_mode=True):
         self.inqueue = inqueue
@@ -93,10 +102,16 @@ class Fetcher(object):
 
         # binding io_loop to http_client here
         if self.async_mode:
-            self.http_client = MyCurlAsyncHTTPClient(max_clients=self.poolsize,
-                                                     io_loop=self.ioloop)
+            if MyCurlAsyncHTTPClient is not None:
+                self.http_client = MyCurlAsyncHTTPClient(max_clients=self.poolsize,
+                                                         io_loop=self.ioloop)
+            else:
+                self.http_client = MySimpleAsyncHTTPClient(max_clients=self.poolsize,
+                                                           io_loop=self.ioloop)
         else:
-            self.http_client = tornado.httpclient.HTTPClient(MyCurlAsyncHTTPClient, max_clients=self.poolsize)
+            client_cls = MyCurlAsyncHTTPClient or MySimpleAsyncHTTPClient
+            self.http_client = tornado.httpclient.HTTPClient(client_cls,
+                                                             max_clients=self.poolsize)
 
         self._cnt = {
             '5m': counter.CounterManager(
@@ -313,13 +328,19 @@ class Fetcher(object):
                 content = ''
 
             robot_txt.parse(content.splitlines())
+            # cache is also cleaned periodically in run(), trigger a TTL
+            # cleanup here as well so the cache stays bounded on code paths
+            # where run() is never called (e.g. sync_fetch only usage)
+            if len(self.robots_txt_cache) >= self.robots_txt_cache_size:
+                self.clear_robot_txt_cache()
             self.robots_txt_cache[domain] = robot_txt
 
         raise gen.Return(robot_txt.can_fetch(user_agent, url))
 
     def clear_robot_txt_cache(self):
         now = time.time()
-        for domain, robot_txt in self.robots_txt_cache.items():
+        for domain in list(self.robots_txt_cache):
+            robot_txt = self.robots_txt_cache[domain]
             if now - robot_txt.mtime() > self.robot_txt_age:
                 del self.robots_txt_cache[domain]
 
@@ -785,6 +806,13 @@ class Fetcher(object):
         if hasattr(self, 'xmlrpc_server'):
             self.xmlrpc_ioloop.add_callback(self.xmlrpc_server.stop)
             self.xmlrpc_ioloop.add_callback(self.xmlrpc_ioloop.stop)
+        # release http client connections/fds
+        http_client = getattr(self, 'http_client', None)
+        if http_client is not None:
+            try:
+                http_client.close()
+            except Exception as e:
+                logger.warning('close http_client error: %r', e)
 
     def size(self):
         return self.http_client.size()

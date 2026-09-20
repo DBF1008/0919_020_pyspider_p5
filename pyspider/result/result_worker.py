@@ -43,6 +43,13 @@ class ResultWorker(object):
 
     def quit(self):
         self._quit = True
+        # release database connections
+        close = getattr(self.resultdb, 'close', None)
+        if close is not None:
+            try:
+                close()
+            except Exception as e:
+                logger.warning('close resultdb error: %r', e)
 
     def run(self):
         '''Run loop'''

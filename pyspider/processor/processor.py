@@ -205,6 +205,13 @@ class Processor(object):
     def quit(self):
         '''Set quit signal'''
         self._quit = True
+        # release database connections
+        close = getattr(self.projectdb, 'close', None)
+        if close is not None:
+            try:
+                close()
+            except Exception as e:
+                logger.warning('close projectdb error: %r', e)
 
     def run(self):
         '''Run loop'''

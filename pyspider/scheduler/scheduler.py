@@ -657,6 +657,17 @@ class Scheduler(object):
         if hasattr(self, 'xmlrpc_server'):
             self.xmlrpc_ioloop.add_callback(self.xmlrpc_server.stop)
             self.xmlrpc_ioloop.add_callback(self.xmlrpc_ioloop.stop)
+        # release database connections
+        for db in (self.taskdb, self.projectdb, self.resultdb):
+            if db is None:
+                continue
+            close = getattr(db, 'close', None)
+            if close is None:
+                continue
+            try:
+                close()
+            except Exception as e:
+                logger.warning('close db error: %r', e)
 
     def run_once(self):
         '''comsume queues and feed tasks to fetcher, once'''

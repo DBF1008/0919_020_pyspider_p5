@@ -7,11 +7,14 @@
 
 from __future__ import unicode_literals, division, absolute_import
 
+import threading
 import logging
 logger = logging.getLogger('database.basedb')
 
 from six import itervalues
 from pyspider.libs import utils
+
+_lock_init_lock = threading.Lock()
 
 
 class BaseDB:
@@ -33,10 +36,42 @@ class BaseDB:
     def dbcur(self):
         raise NotImplementedError
 
+    @property
+    def _db_lock(self):
+        '''Per-instance execute lock, created lazily as subclasses
+        don't call BaseDB.__init__'''
+        lock = self.__dict__.get('_execute_lock')
+        if lock is None:
+            with _lock_init_lock:
+                lock = self.__dict__.get('_execute_lock')
+                if lock is None:
+                    lock = self.__dict__['_execute_lock'] = threading.RLock()
+        return lock
+
     def _execute(self, sql_query, values=[]):
-        dbcur = self.dbcur
-        dbcur.execute(sql_query, values)
-        return dbcur
+        # serialize execute on the shared connection to avoid
+        # interleaved commands under high concurrency
+        with self._db_lock:
+            dbcur = self.dbcur
+            dbcur.execute(sql_query, values)
+            return dbcur
+
+    def close(self):
+        '''Close underlying connection/engine, release resources.'''
+        conn = getattr(self, 'conn', None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception as e:
+                logger.warning('close db connection error: %r', e)
+            self.conn = None
+        engine = getattr(self, 'engine', None)
+        if engine is not None:
+            try:
+                engine.dispose()
+            except Exception as e:
+                logger.warning('dispose db engine error: %r', e)
+            self.engine = None
 
     def _select(self, tablename=None, what="*", where="", where_values=[], offset=0, limit=None):
         tablename = self.escape(tablename or self.__tablename__)
@@ -52,8 +87,16 @@ class BaseDB:
             sql_query += " LIMIT %d, %d" % (offset, self.maxlimit)
         logger.debug("<sql: %s>", sql_query)
 
-        for row in self._execute(sql_query, where_values):
-            yield row
+        dbcur = self._execute(sql_query, where_values)
+        try:
+            for row in dbcur:
+                yield row
+        finally:
+            # release cursor/result set even if generator is abandoned
+            try:
+                dbcur.close()
+            except Exception:
+                pass
 
     def _select2dic(self, tablename=None, what="*", where="", where_values=[],
                     order=None, offset=0, limit=None):
@@ -78,8 +121,14 @@ class BaseDB:
         # https://github.com/mysql/mysql-connector-python/pull/37
         fields = [utils.text(f[0]) for f in dbcur.description]
 
-        for row in dbcur:
-            yield dict(zip(fields, row))
+        try:
+            for row in dbcur:
+                yield dict(zip(fields, row))
+        finally:
+            try:
+                dbcur.close()
+            except Exception:
+                pass
 
     def _replace(self, tablename=None, **values):
         tablename = self.escape(tablename or self.__tablename__)
@@ -95,7 +144,13 @@ class BaseDB:
             dbcur = self._execute(sql_query, list(itervalues(values)))
         else:
             dbcur = self._execute(sql_query)
-        return dbcur.lastrowid
+        try:
+            return dbcur.lastrowid
+        finally:
+            try:
+                dbcur.close()
+            except Exception:
+                pass
 
     def _insert(self, tablename=None, **values):
         tablename = self.escape(tablename or self.__tablename__)
@@ -111,7 +166,13 @@ class BaseDB:
             dbcur = self._execute(sql_query, list(itervalues(values)))
         else:
             dbcur = self._execute(sql_query)
-        return dbcur.lastrowid
+        try:
+            return dbcur.lastrowid
+        finally:
+            try:
+                dbcur.close()
+            except Exception:
+                pass
 
     def _update(self, tablename=None, where="1=0", where_values=[], **values):
         tablename = self.escape(tablename or self.__tablename__)

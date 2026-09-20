@@ -38,8 +38,11 @@ class ProjectManager(object):
         if env is None:
             env = {}
         # fix for old non-package version scripts
-        pyspider_path = os.path.join(os.path.dirname(__file__), "..")
-        if pyspider_path not in sys.path:
+        # normalize the path and compare with normalized sys.path entries,
+        # otherwise every module reload would insert a duplicated entry
+        # and sys.path would grow without bound
+        pyspider_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        if pyspider_path not in (os.path.abspath(p) for p in sys.path):
             sys.path.insert(1, pyspider_path)
 
         env = dict(env)
