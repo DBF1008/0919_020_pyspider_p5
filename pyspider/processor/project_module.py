@@ -8,8 +8,8 @@
 import os
 import six
 import sys
-import imp
 import time
+import types
 import weakref
 import logging
 import inspect
@@ -18,6 +18,20 @@ import linecache
 from pyspider.libs import utils
 from pyspider.libs.log import SaveLogHandler, LogFormatter
 logger = logging.getLogger("processor")
+
+
+def _ensure_pyspider_in_path():
+    '''Add pyspider path to sys.path once, for old non-package version scripts.
+
+    The path is normalized and deduplicated, so repeated calls (e.g. on
+    every project reload) will not grow sys.path.
+    '''
+    pyspider_path = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    if pyspider_path not in sys.path:
+        sys.path.insert(1, pyspider_path)
+
+
+_ensure_pyspider_in_path()
 
 
 class ProjectManager(object):
@@ -38,9 +52,7 @@ class ProjectManager(object):
         if env is None:
             env = {}
         # fix for old non-package version scripts
-        pyspider_path = os.path.join(os.path.dirname(__file__), "..")
-        if pyspider_path not in sys.path:
-            sys.path.insert(1, pyspider_path)
+        _ensure_pyspider_in_path()
 
         env = dict(env)
         env.update({
@@ -165,7 +177,7 @@ class ProjectLoader(object):
 
     def load_module(self, fullname):
         if self.mod is None:
-            self.mod = mod = imp.new_module(fullname)
+            self.mod = mod = types.ModuleType(fullname)
         else:
             mod = self.mod
         mod.__file__ = '<%s>' % self.name
@@ -216,7 +228,7 @@ if six.PY2:
                     return ProjectLoader(info)
 
         def load_module(self, fullname):
-            mod = imp.new_module(fullname)
+            mod = types.ModuleType(fullname)
             mod.__file__ = '<projects>'
             mod.__loader__ = self
             mod.__path__ = ['<projects>']
@@ -257,7 +269,7 @@ else:
 
     class ProjectsLoader(importlib.abc.InspectLoader):
         def load_module(self, fullname):
-            mod = imp.new_module(fullname)
+            mod = types.ModuleType(fullname)
             mod.__file__ = '<projects>'
             mod.__loader__ = self
             mod.__path__ = ['<projects>']

@@ -27,8 +27,13 @@ from six.moves.urllib.robotparser import RobotFileParser
 from requests import cookies
 from six.moves.urllib.parse import urljoin, urlsplit
 from tornado import gen
-from tornado.curl_httpclient import CurlAsyncHTTPClient
 from tornado.simple_httpclient import SimpleAsyncHTTPClient
+
+try:
+    from tornado.curl_httpclient import CurlAsyncHTTPClient
+except ImportError:
+    # pycurl is not available, fallback to SimpleAsyncHTTPClient
+    CurlAsyncHTTPClient = None
 
 from pyspider.libs import utils, dataurl, counter
 from pyspider.libs.url import quote_chinese
@@ -36,13 +41,16 @@ from .cookie_utils import extract_cookies_to_jar
 logger = logging.getLogger('fetcher')
 
 
-class MyCurlAsyncHTTPClient(CurlAsyncHTTPClient):
+if CurlAsyncHTTPClient is not None:
+    class MyCurlAsyncHTTPClient(CurlAsyncHTTPClient):
 
-    def free_size(self):
-        return len(self._free_list)
+        def free_size(self):
+            return len(self._free_list)
 
-    def size(self):
-        return len(self._curls) - self.free_size()
+        def size(self):
+            return len(self._curls) - self.free_size()
+else:
+    MyCurlAsyncHTTPClient = None
 
 
 class MySimpleAsyncHTTPClient(SimpleAsyncHTTPClient):
@@ -77,6 +85,7 @@ class Fetcher(object):
     splash_endpoint = None
     splash_lua_source = open(os.path.join(os.path.dirname(__file__), "splash_fetcher.lua")).read()
     robot_txt_age = 60*60  # 1h
+    robot_txt_cache_clean_interval = 10*60  # 10min
 
     def __init__(self, inqueue, outqueue, poolsize=100, proxy=None, async_mode=True):
         self.inqueue = inqueue
@@ -90,13 +99,21 @@ class Fetcher(object):
         self.ioloop = tornado.ioloop.IOLoop()
 
         self.robots_txt_cache = {}
+        self._robots_txt_cache_last_clean = time.time()
 
         # binding io_loop to http_client here
         if self.async_mode:
-            self.http_client = MyCurlAsyncHTTPClient(max_clients=self.poolsize,
-                                                     io_loop=self.ioloop)
+            http_client_cls = MyCurlAsyncHTTPClient or MySimpleAsyncHTTPClient
+            try:
+                self.http_client = http_client_cls(max_clients=self.poolsize,
+                                                   io_loop=self.ioloop)
+            except TypeError:
+                # the io_loop argument was removed in tornado >= 6
+                self.http_client = http_client_cls(max_clients=self.poolsize)
         else:
-            self.http_client = tornado.httpclient.HTTPClient(MyCurlAsyncHTTPClient, max_clients=self.poolsize)
+            self.http_client = tornado.httpclient.HTTPClient(
+                MyCurlAsyncHTTPClient or MySimpleAsyncHTTPClient,
+                max_clients=self.poolsize)
 
         self._cnt = {
             '5m': counter.CounterManager(
@@ -290,9 +307,18 @@ class Fetcher(object):
     def can_fetch(self, user_agent, url):
         parsed = urlsplit(url)
         domain = parsed.netloc
+
+        # clean expired robots.txt cache periodically to avoid
+        # unbounded memory growth on long running fetcher
+        now = time.time()
+        if now - self._robots_txt_cache_last_clean > self.robot_txt_cache_clean_interval:
+            self.clear_robot_txt_cache()
+            self._robots_txt_cache_last_clean = now
+
         if domain in self.robots_txt_cache:
             robot_txt = self.robots_txt_cache[domain]
-            if time.time() - robot_txt.mtime() > self.robot_txt_age:
+            if now - robot_txt.mtime() > self.robot_txt_age:
+                del self.robots_txt_cache[domain]
                 robot_txt = None
         else:
             robot_txt = None
@@ -319,7 +345,7 @@ class Fetcher(object):
 
     def clear_robot_txt_cache(self):
         now = time.time()
-        for domain, robot_txt in self.robots_txt_cache.items():
+        for domain, robot_txt in list(self.robots_txt_cache.items()):
             if now - robot_txt.mtime() > self.robot_txt_age:
                 del self.robots_txt_cache[domain]
 
@@ -785,6 +811,12 @@ class Fetcher(object):
         if hasattr(self, 'xmlrpc_server'):
             self.xmlrpc_ioloop.add_callback(self.xmlrpc_server.stop)
             self.xmlrpc_ioloop.add_callback(self.xmlrpc_ioloop.stop)
+        # release resources: close http client (fd) and clear caches
+        try:
+            self.http_client.close()
+        except Exception as e:
+            logger.exception(e)
+        self.robots_txt_cache.clear()
 
     def size(self):
         return self.http_client.size()

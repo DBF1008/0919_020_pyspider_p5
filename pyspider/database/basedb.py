@@ -10,8 +10,92 @@ from __future__ import unicode_literals, division, absolute_import
 import logging
 logger = logging.getLogger('database.basedb')
 
+import threading
+
 from six import itervalues
 from pyspider.libs import utils
+
+
+class ConnectionPool(object):
+    '''
+    A simple thread-safe connection pool.
+
+    Connections are created lazily by ``connect`` factory and reused
+    across callers. ``maxsize`` limits the total number of connections
+    created by the pool. Always ``release`` a connection after use,
+    and call ``closeall`` when the pool is no longer needed.
+    '''
+
+    def __init__(self, connect, maxsize=10):
+        self._connect = connect
+        self._maxsize = maxsize
+        self._pool = []
+        self._size = 0
+        self._closed = False
+        self._cond = threading.Condition()
+
+    def get(self, timeout=None):
+        '''Get a connection from pool, create one if not full.'''
+        with self._cond:
+            while True:
+                if self._closed:
+                    raise RuntimeError("connection pool is closed")
+                if self._pool:
+                    return self._pool.pop()
+                if self._size < self._maxsize:
+                    self._size += 1
+                    break
+                if not self._cond.wait(timeout):
+                    raise RuntimeError("get connection from pool timeout")
+        try:
+            return self._connect()
+        except Exception:
+            with self._cond:
+                self._size -= 1
+                self._cond.notify()
+            raise
+
+    def release(self, conn):
+        '''Release a connection back to pool.'''
+        if conn is None:
+            return
+        with self._cond:
+            if self._closed:
+                self._size -= 1
+                close = getattr(conn, 'close', None)
+                if close is not None:
+                    try:
+                        close()
+                    except Exception:
+                        logger.exception("close connection error")
+            else:
+                self._pool.append(conn)
+            self._cond.notify()
+
+    def closeall(self):
+        '''Close all pooled connections and shutdown the pool.'''
+        with self._cond:
+            self._closed = True
+            pool, self._pool = self._pool, []
+            self._size -= len(pool)
+            self._cond.notify_all()
+        for conn in pool:
+            close = getattr(conn, 'close', None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    logger.exception("close connection error")
+
+    @property
+    def size(self):
+        '''Total connections created by the pool.'''
+        return self._size
+
+    @property
+    def free_size(self):
+        '''Connections currently idle in the pool.'''
+        return len(self._pool)
 
 
 class BaseDB:
@@ -35,8 +119,30 @@ class BaseDB:
 
     def _execute(self, sql_query, values=[]):
         dbcur = self.dbcur
-        dbcur.execute(sql_query, values)
+        try:
+            dbcur.execute(sql_query, values)
+        except Exception:
+            # close the broken cursor to avoid cursor/connection leak
+            try:
+                dbcur.close()
+            except Exception:
+                pass
+            raise
         return dbcur
+
+    def close(self):
+        '''Close underlying connection and release resources.'''
+        conn = getattr(self, 'conn', None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                logger.exception("close database connection error")
+            self.conn = None
+
+    def quit(self):
+        '''Alias of close, for unified component lifecycle management.'''
+        self.close()
 
     def _select(self, tablename=None, what="*", where="", where_values=[], offset=0, limit=None):
         tablename = self.escape(tablename or self.__tablename__)
@@ -52,8 +158,12 @@ class BaseDB:
             sql_query += " LIMIT %d, %d" % (offset, self.maxlimit)
         logger.debug("<sql: %s>", sql_query)
 
-        for row in self._execute(sql_query, where_values):
-            yield row
+        dbcur = self._execute(sql_query, where_values)
+        try:
+            for row in dbcur:
+                yield row
+        finally:
+            dbcur.close()
 
     def _select2dic(self, tablename=None, what="*", where="", where_values=[],
                     order=None, offset=0, limit=None):
@@ -74,12 +184,15 @@ class BaseDB:
 
         dbcur = self._execute(sql_query, where_values)
 
-        # f[0] may return bytes type
-        # https://github.com/mysql/mysql-connector-python/pull/37
-        fields = [utils.text(f[0]) for f in dbcur.description]
+        try:
+            # f[0] may return bytes type
+            # https://github.com/mysql/mysql-connector-python/pull/37
+            fields = [utils.text(f[0]) for f in dbcur.description]
 
-        for row in dbcur:
-            yield dict(zip(fields, row))
+            for row in dbcur:
+                yield dict(zip(fields, row))
+        finally:
+            dbcur.close()
 
     def _replace(self, tablename=None, **values):
         tablename = self.escape(tablename or self.__tablename__)
@@ -95,7 +208,10 @@ class BaseDB:
             dbcur = self._execute(sql_query, list(itervalues(values)))
         else:
             dbcur = self._execute(sql_query)
-        return dbcur.lastrowid
+        try:
+            return dbcur.lastrowid
+        finally:
+            dbcur.close()
 
     def _insert(self, tablename=None, **values):
         tablename = self.escape(tablename or self.__tablename__)
@@ -111,7 +227,10 @@ class BaseDB:
             dbcur = self._execute(sql_query, list(itervalues(values)))
         else:
             dbcur = self._execute(sql_query)
-        return dbcur.lastrowid
+        try:
+            return dbcur.lastrowid
+        finally:
+            dbcur.close()
 
     def _update(self, tablename=None, where="1=0", where_values=[], **values):
         tablename = self.escape(tablename or self.__tablename__)
